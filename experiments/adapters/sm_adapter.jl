@@ -1,0 +1,332 @@
+# This file contains specific dispatches that are defined in 
+# SoleModels.jl, at ext/XGBoostExt.jl
+#
+# By default, SoleModels.solemodel(::Vector{<:XGBoost.Node}, ...) only returns 
+# a XGBoostClassifier, and not a regressor!
+# This is an ugly hotfix; see `early_return`.
+
+using SoleModels
+using XGBoost
+
+using CategoricalArrays
+
+import SoleModels: alphabet, solemodel
+
+# ---------------------------------------------------------------------------- #
+#                          DecisionXGBoost alphabet                            #
+# ---------------------------------------------------------------------------- #
+function alphabet(model::XGBoost.Booster; kwargs...)
+    # error("TODO fix and test.")
+    function _alphabet!(a::Vector, model::XGBoost.Booster; kwargs...)
+        return a
+    end
+    function _alphabet!(a::Vector, tree::XGBoost.Node; kwargs...)
+        # Base case: if it's a leaf node
+        if length(tree.children) == 0
+            return a
+        end
+
+        # Recursive case: split node
+        feature = Sole.VariableValue(
+            tree.split isa String ? Symbol(tree.split) : tree.split
+        )
+        condition = ScalarCondition(feature, (<), tree.split_condition) # TODO verify.
+        push!(a, condition)
+        if length(tree.children) == 2
+            _alphabet!(a, tree.children[1]; with_stats, kwargs...)
+            _alphabet!(a, tree.children[2]; with_stats, kwargs...)
+        else
+            error(
+                "Found $(length(tree.children)) children while 2 were expected: $(tree.children).",
+            )
+        end
+        return a
+    end
+    return _alphabet!(Atom{ScalarCondition}[], model; kwargs...)
+end
+
+function get_condition(featidstr, featval, featurenames; test_operator)
+    featid = parse(Int, featidstr[2:end]) + 1 # considering 0-based indexing in XGBoost feature ids
+    feature = if isnothing(featurenames)
+        VariableValue(featid)
+    else
+        VariableValue(featid, featurenames[featid])
+    end
+    return ScalarCondition(feature, test_operator, featval)
+end
+
+function get_condition(class_idx, featurenames; test_operator, featval)
+    feature = if isnothing(featurenames)
+        VariableValue(class_idx)
+    else
+        VariableValue(class_idx, featurenames[class_idx])
+    end
+    return ScalarCondition(feature, test_operator, featval)
+end
+
+get_operator(atom::Atom{<:ScalarCondition}) = atom.value.metacond.test_operator
+function get_i_variable(atom::Atom{<:ScalarCondition})
+    return atom.value.metacond.feature.i_variable
+end
+get_threshold(atom::Atom{<:ScalarCondition}) = atom.value.threshold
+
+function satisfies_conditions(row, formula)
+    return all(
+        atom ->
+            get_operator(atom)(row[get_i_variable(atom)], get_threshold(atom)),
+        formula,
+    )
+end
+
+function bitmap_check_conditions(X, formula)
+    return BitVector([satisfies_conditions(row, formula) for row in eachrow(X)])
+end
+
+function early_return(leaf, antecedent, clabel, classl)
+    # Beware: this forces the conversion from anything to string
+    label = clabel isa AbstractVector ? first(clabel) : clabel
+    label = string(label)
+    classl = string(classl)
+
+    info = (;
+        leaf_value=leaf,
+        supporting_predictions=[label],
+        supporting_labels=[classl],
+    )
+
+    return Branch(
+        antecedent,
+        SoleModels.ConstantModel(label, info),
+        SoleModels.ConstantModel(label, info),
+        info,
+    )
+
+    # OLD VERSION
+    # info = (;
+    #     leaf_value = leaf,
+    #     supporting_predictions = clabel,
+    #     supporting_labels = [classl],
+    # )
+    #
+    # println("Type of antecedent: $(typeof(antecedent))")
+    #
+    # return Branch(
+    #     antecedent,
+    #     SoleModels.ConstantModel(first(clabel), info),
+    #     SoleModels.ConstantModel(first(clabel), info),
+    #     info,
+    # )
+end
+
+# ---------------------------------------------------------------------------- #
+#                              XGBoost solemodel                               #
+# ---------------------------------------------------------------------------- #
+function SoleModels.solemodel(
+    model::Vector{<:XGBoost.Node},
+    X::AbstractMatrix,
+    y::AbstractVector;
+    classlabels=nothing,
+    featurenames=nothing,
+    keep_condensed=false,
+    use_float32::Bool=true,
+    kwargs...,
+)
+    keep_condensed && error("Cannot keep condensed XGBoost.Node.")
+
+    isnothing(classlabels) || (nclasses = length(classlabels))
+
+    trees = map(enumerate(model)) do (i, t)
+        if isnothing(classlabels)
+            begin
+                class_idx = nothing
+                clabels = nothing
+            end
+        else
+            begin
+                class_idx = (i - 1) % nclasses + 1
+                clabels = categorical([classlabels[class_idx]])
+            end
+        end
+        # xgboost trees could be composed of only one leaf, without any split
+        if t.split === nothing
+            antecedent = Atom(
+                get_condition(
+                    class_idx, featurenames; test_operator=(<), featval=Inf
+                ),
+            )
+            leaf = use_float32 ? Float32(t.leaf) : t.leaf
+
+            # WARNING: triggering this causes the trees to return a 
+            # Vector{Branch} instead of, say, Vector{Branch{String}}
+            early_return(leaf, antecedent, clabels, classlabels[class_idx])
+        else
+            SoleModels.solemodel(
+                t,
+                X,
+                y;
+                classlabels,
+                class_idx,
+                clabels,
+                featurenames,
+                use_float32,
+                kwargs...,
+            )
+        end
+    end
+
+    info = merge(
+        isnothing(featurenames) ? (;) : (; featurenames=featurenames),
+        (;
+            leaf_value=reduce(
+                vcat, getindex.(getproperty.(trees, :info), :leaf_value)
+            ),
+            supporting_predictions=reduce(
+                vcat,
+                getindex.(getproperty.(trees, :info), :supporting_predictions),
+            ),
+            supporting_labels=reduce(
+                vcat, getindex.(getproperty.(trees, :info), :supporting_labels)
+            ),
+        ),
+    )
+
+    _dxgb = DecisionXGBoost(trees, info)
+    return _dxgb
+end
+
+"""
+    solemodel(tree::XGBoost.Node; fl=Formula[], fr=Formula[], classlabels=nothing, featurenames=nothing, keep_condensed=false)
+
+Traverses a learned XGBoost tree, collecting the path conditions for each branch. 
+Left paths (<) store conditions in `fl`, right paths (≥) store conditions in `fr`. 
+When reaching a leaf, calls `xgbleaf` with the path's collected conditions.
+"""
+function SoleModels.solemodel(
+    tree::XGBoost.Node,
+    X::AbstractMatrix,
+    y::AbstractVector;
+    classlabels=nothing,
+    class_idx=nothing,
+    clabels=nothing,
+    featurenames=nothing,
+    path_conditions=Formula[],
+    use_float32::Bool,
+)
+    split_condition =
+        use_float32 ? Float32(tree.split_condition) : tree.split_condition
+    antecedent = Atom(
+        get_condition(
+            tree.split, split_condition, featurenames; test_operator=(<)
+        ),
+    )
+
+    # create a new path for the left branch
+    left_path = copy(path_conditions)
+    push!(
+        left_path,
+        Atom(
+            get_condition(
+                tree.split, split_condition, featurenames; test_operator=(<)
+            ),
+        ),
+    )
+
+    # create a new path for the right branch
+    right_path = copy(path_conditions)
+    push!(
+        right_path,
+        Atom(
+            get_condition(
+                tree.split, split_condition, featurenames; test_operator=(≥)
+            ),
+        ),
+    )
+
+    lefttree = if isnothing(tree.children[1].split)
+        xgbleaf(tree.children[1]; formula=left_path, X, y, classlabels, use_float32)
+    else
+        SoleModels.solemodel(
+            tree.children[1],
+            X,
+            y;
+            path_conditions=left_path,
+            classlabels,
+            class_idx,
+            clabels,
+            featurenames,
+            use_float32,
+        )
+    end
+
+    righttree = if isnothing(tree.children[2].split)
+        xgbleaf(
+            tree.children[2];
+            formula=right_path,
+            X,
+            y,
+            classlabels,
+            use_float32,
+        )
+    else
+        SoleModels.solemodel(
+            tree.children[2],
+            X,
+            y;
+            path_conditions=right_path,
+            classlabels,
+            class_idx,
+            clabels,
+            featurenames,
+            use_float32,
+        )
+    end
+
+    info = (;
+        leaf_value=[
+            lefttree.info[:leaf_value]..., righttree.info[:leaf_value]...
+        ],
+        supporting_predictions=[
+            lefttree.info[:supporting_predictions]...,
+            righttree.info[:supporting_predictions]...,
+        ],
+        supporting_labels=[
+            lefttree.info[:supporting_labels]...,
+            righttree.info[:supporting_labels]...,
+        ],
+    )
+    return Branch(antecedent, lefttree, righttree, info)
+end
+
+function xgbleaf(
+    leaf::XGBoost.Node;
+    formula::Vector{<:Formula},
+    X::AbstractMatrix,
+    y::AbstractVector,
+    classlabels=nothing,
+    use_float32::Bool,
+)
+    if isnothing(classlabels)
+        # regression
+        prediction = use_float32 ? Float32(leaf.leaf) : leaf.leaf
+    else
+        #classification
+        bitX = bitmap_check_conditions(X, formula)
+        # this could happens when the split condition doesn't match any class
+        !any(bitX) && (bitX = trues(length(y)))
+        prediction = SoleModels.bestguess(y[bitX]; suppress_parity_warning=true)
+
+        isnothing(prediction) && return nothing
+    end
+
+    leaf_value = use_float32 ? Float32(leaf.leaf) : leaf.leaf
+
+    labels = unique(y)
+
+    info = (;
+        leaf_value,
+        supporting_predictions=fill(prediction, length(labels)),
+        supporting_labels=labels,
+    )
+
+    return SoleModels.ConstantModel(prediction, info)
+end
